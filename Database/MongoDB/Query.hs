@@ -276,10 +276,10 @@ auth un pw = do
     mmv <- readMaybe . T.unpack . head . T.splitOn "." <$> serverVersion
     maybe (return False) performAuth mmv
     where
-    performAuth majorVersion =
-        if majorVersion >= (3 :: Int)
-        then authSCRAMSHA1 un pw
-        else authMongoCR un pw
+    performAuth majorVersion
+        | majorVersion >= (4 :: Int) = authSCRAMSHA256 un pw
+        | majorVersion >= 3 = authSCRAMSHA1 un pw
+        | otherwise = authMongoCR un pw
 
 authMongoCR :: (MonadIO m) => Username -> Password -> Action m Bool
 -- ^ Authenticate with the current database, using the MongoDB-CR authentication mechanism (default in MongoDB server < 3.0)

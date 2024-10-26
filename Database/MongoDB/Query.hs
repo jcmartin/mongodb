@@ -133,9 +133,8 @@ import Database.MongoDB.Internal.Protocol
     pwKey,
     FlagBit (..)
   )
-import Control.Monad.Trans.Except
 import qualified Database.MongoDB.Internal.Protocol as P
-import Database.MongoDB.Internal.Util (liftIOE, loop, true1, (<.>), splitDot)
+import Database.MongoDB.Internal.Util (liftIOE, loop, true1, (<.>))
 import System.Mem.Weak (Weak)
 import Text.Read (readMaybe)
 import Prelude hiding (lookup)

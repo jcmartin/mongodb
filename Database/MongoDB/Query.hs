@@ -133,9 +133,8 @@ import Database.MongoDB.Internal.Protocol
     pwKey,
     FlagBit (..)
   )
-import Control.Monad.Trans.Except
 import qualified Database.MongoDB.Internal.Protocol as P
-import Database.MongoDB.Internal.Util (liftIOE, loop, true1, (<.>), splitDot)
+import Database.MongoDB.Internal.Util (liftIOE, loop, true1, (<.>))
 import System.Mem.Weak (Weak)
 import Text.Read (readMaybe)
 import Prelude hiding (lookup)
@@ -155,8 +154,8 @@ access mongoPipe mongoAccessMode mongoDatabase action = runReaderT action MongoC
 data Failure =
      ConnectionFailure IOError  -- ^ TCP connection ('Pipeline') failed. May work if you try again on the same Mongo 'Connection' which will create a new Pipe.
     | CursorNotFoundFailure CursorId  -- ^ Cursor expired because it wasn't accessed for over 10 minutes, or this cursor came from a different server that the one you are currently connected to (perhaps a fail over happen between servers in a replica set)
-    | QueryFailure ErrorCode String  -- ^ Query failed for some reason as described in the string
-    | WriteFailure Int ErrorCode String -- ^ Error observed by getLastError after a write, error description is in string, index of failed document is the first argument
+    | QueryFailure (Maybe ErrorCode) String  -- ^ Query failed for some reason as described in the string
+    | WriteFailure Int (Maybe ErrorCode) String -- ^ Error observed by getLastError after a write, error description is in string, index of failed document is the first argument
     | WriteConcernFailure Int String  -- ^ Write concern error. It's reported only by insert, update, delete commands. Not by wire protocol.
     | DocNotFound Selection  -- ^ 'fetch' found no document matching selection
     | AggregateFailure String -- ^ 'aggregate' returned an error
@@ -273,13 +272,18 @@ auth :: MonadIO m => Username -> Password -> Action m Bool
 -- ^ Authenticate with the current database (if server is running in secure mode). Return whether authentication was successful or not. Reauthentication is required for every new pipe. SCRAM-SHA-1 will be used for server versions 3.0+, MONGO-CR for lower versions.
 auth un pw = do
     let serverVersion = fmap (at "version") $ useDb "admin" $ runCommand ["buildinfo" =: (1 :: Int)]
-    mmv <- readMaybe . T.unpack . head . T.splitOn "." <$> serverVersion
+    mmv <- takeMajorVersion <$> serverVersion
     maybe (return False) performAuth mmv
     where
     performAuth majorVersion
         | majorVersion >= (4 :: Int) = authSCRAMSHA256 un pw
         | majorVersion >= 3 = authSCRAMSHA1 un pw
         | otherwise = authMongoCR un pw
+
+takeMajorVersion :: Text -> Maybe Int
+takeMajorVersion t = case T.splitOn "." t of
+    []    -> fail $ "Expected a version number with a period. Received: " <> show t
+    (x:_) -> readMaybe $ T.unpack x
 
 authMongoCR :: (MonadIO m) => Username -> Password -> Action m Bool
 -- ^ Authenticate with the current database, using the MongoDB-CR authentication mechanism (default in MongoDB server < 3.0)
@@ -494,7 +498,10 @@ insert col doc = do
   res <- insertBlock [] col (0, [doc'])
   case res of
     Left failure -> liftIO $ throwIO failure
-    Right r -> return $ head r
+    Right r -> case r of
+        []    -> error "Insertion did not return an _id value"
+        (h:_) -> return h
+
 
 insert_ :: (MonadIO m) => Collection -> Document -> Action m ()
 -- ^ Same as 'insert' except don't return _id
@@ -565,11 +572,14 @@ insert' opts col docs = do
   chunkResults <- interruptibleFor ordered (zip lSums chunks) $ insertBlock opts col
 
   let lchunks = lefts preChunks
-  when (not $ null lchunks) $ do
-    liftIO $ throwIO $ head lchunks
+  case lchunks of
+    [] -> return ()
+    (h:_) -> liftIO $ throwIO h
 
   let lresults = lefts chunkResults
-  when (not $ null lresults) $ liftIO $ throwIO $ head lresults
+  case lresults of
+    [] -> return ()
+    (h:_) -> liftIO $ throwIO h
   return $ concat $ rights chunkResults
 
 insertBlock :: (MonadIO m)
@@ -587,7 +597,7 @@ insertBlock opts col (prevCount, docs) = do
         let errorMessage = do
               jRes <- res
               em <- lookup "err" jRes
-              return $ WriteFailure prevCount (fromMaybe 0 $ lookup "code" jRes)  em
+              return $ WriteFailure prevCount (lookup "code" jRes)  em
               -- In older versions of ^^ the protocol we can't really say which document failed.
               -- So we just report the accumulated number of documents in the previous blocks.
 
@@ -609,20 +619,20 @@ insertBlock opts col (prevCount, docs) = do
           (Nothing, Just err) -> do
             return $ Left $ WriteFailure
                                     prevCount
-                                    (fromMaybe 0 $ lookup "ok" doc)
+                                    (lookup "ok" doc)
                                     (show err)
           (Just (Array errs), Just writeConcernErr) -> do
             let writeErrors = map (anyToWriteError prevCount) errs
             let errorsWithFailureIndex = map (addFailureIndex prevCount) writeErrors
             return $ Left $ CompoundFailure $ WriteFailure
                                     prevCount
-                                    (fromMaybe 0 $ lookup "ok" doc)
+                                    (lookup "ok" doc)
                                     (show writeConcernErr) : errorsWithFailureIndex
           (Just unknownValue, Nothing) -> do
             return $ Left $ ProtocolFailure prevCount $ "Expected array of errors. Received: " ++ show unknownValue
           (Just unknownValue, Just writeConcernErr) -> do
             return $ Left $ CompoundFailure [ ProtocolFailure prevCount $ "Expected array of errors. Received: " ++ show unknownValue
-                                              , WriteFailure prevCount (fromMaybe 0 $ lookup "ok" doc) $ show writeConcernErr]
+                                              , WriteFailure prevCount (lookup "ok" doc) $ show writeConcernErr]
       else do
         mode <- asks mongoWriteMode
         let writeConcern = case mode of
@@ -638,20 +648,20 @@ insertBlock opts col (prevCount, docs) = do
           (Nothing, Just err) -> do
             return $ Left $ WriteFailure
                                     prevCount
-                                    (fromMaybe 0 $ lookup "ok" doc)
+                                    (lookup "ok" doc)
                                     (show err)
           (Just (Array errs), Just writeConcernErr) -> do
             let writeErrors = map (anyToWriteError prevCount) errs
             let errorsWithFailureIndex = map (addFailureIndex prevCount) writeErrors
             return $ Left $ CompoundFailure $ WriteFailure
                                     prevCount
-                                    (fromMaybe 0 $ lookup "ok" doc)
+                                    (lookup "ok" doc)
                                     (show writeConcernErr) : errorsWithFailureIndex
           (Just unknownValue, Nothing) -> do
             return $ Left $ ProtocolFailure prevCount $ "Expected array of errors. Received: " ++ show unknownValue
           (Just unknownValue, Just writeConcernErr) -> do
             return $ Left $ CompoundFailure [ ProtocolFailure prevCount $ "Expected array of errors. Received: " ++ show unknownValue
-                                              , WriteFailure prevCount (fromMaybe 0 $ lookup "ok" doc) $ show writeConcernErr]
+                                              , WriteFailure prevCount (lookup "ok" doc) $ show writeConcernErr]
 
 splitAtLimit :: Int -> Int -> [Document] -> [Either Failure [Document]]
 splitAtLimit maxSize maxCount list = chop (go 0 0 []) list
@@ -669,7 +679,7 @@ splitAtLimit maxSize maxCount list = chop (go 0 0 []) list
           if (curSize + size > maxSize) || (curCount + 1 > maxCount)
             then
               if curCount == 0
-                then (Left $ WriteFailure 0 0 "One document is too big for the message", xs)
+                then (Left $ WriteFailure 0 Nothing "One document is too big for the message", xs)
                 else (Right $ reverse res, x : xs)
             else go (curSize + size) (curCount + 1) (x : res) xs
 
@@ -988,7 +998,7 @@ docToWriteError :: Document -> Failure
 docToWriteError doc = WriteFailure ind code msg
   where
     ind  = at "index"  doc
-    code = at "code"   doc
+    code = lookup "code" doc
     msg  = at "errmsg" doc
 
 -- ** Delete
@@ -1473,7 +1483,9 @@ explain q = do  -- same as findOne but with explain set to true
     qr <- queryRequest True q {limit = 1}
     r <- liftIO $ request pipe [] qr
     Batch _ _ docs <- liftDB $ fulfill r
-    return $ if null docs then error ("no explain: " ++ show q) else head docs
+    case docs of
+        [] -> error ("no explain: " ++ show q)
+        (h:_) -> return h
 
 count :: (MonadIO m) => Query -> Action m Int
 -- ^ Fetch number of documents satisfying query (including effect of skip and/or limit if present)
@@ -1574,13 +1586,21 @@ fromReply limit Reply{..} = do
     checkResponseFlag flag = case flag of
         AwaitCapable -> return ()
         CursorNotFound -> throwIO $ CursorNotFoundFailure rCursorId
-        QueryError -> throwIO $ QueryFailure (at "code" $ head rDocuments) (at "$err" $ head rDocuments)
-fromReply limit ReplyOpMsg{..} = do
-    let section = head sections
-        cur = maybe Nothing cast $ look "cursor" section
-    case cur of
-      Nothing -> return (Batch limit 0 sections)
-      Just doc ->
+        QueryError ->
+            let code = case rDocuments of
+                    [] -> fail "Documents are empty"
+                    (h:_) -> lookup "code" h
+                errString = case rDocuments of
+                    [] -> "No documents in response"
+                    (h:_) -> case lookup "$err" h of
+                        Nothing  -> "$err is missing in documents."
+                        Just err -> err
+            in throwIO $ QueryFailure code errString
+fromReply limit ReplyOpMsg{..} = case sections of
+    [] -> return (Batch limit 0 sections)
+    (section:_) -> case maybe Nothing cast $ look "cursor" section of
+        Nothing -> return (Batch limit 0 sections)
+        Just doc ->
           case look "firstBatch" doc of
             Just ar -> do
               let docs = fromJust $ cast ar

@@ -11,7 +11,7 @@ module Database.MongoDB.Admin (
     Index(..), IndexName, index, ensureIndex, createIndex, dropIndex,
     getIndexes, dropIndexes,
     -- ** User
-    allUsers, addUser, removeUser,
+    allUsers, addUser, changeUserPassword, removeUser,
     -- ** Database
     admin, cloneDatabase, copyDatabase, dropDatabase, repairDatabase,
     -- ** Server
@@ -206,6 +206,13 @@ addUser readOnly user pass = do
 removeUser :: (MonadIO m)
            => Username -> Action m ()
 removeUser user = delete (select ["user" =: user] "system.users")
+
+-- | This operates like the shell command db.changeUserPassword
+changeUserPassword :: MonadIO m => Username -> Password -> Action m Document
+changeUserPassword user pw = runCommand
+    ["updateUser" =: user
+    ,"pwd"        =: pw
+    ]
 
 -- ** Database
 

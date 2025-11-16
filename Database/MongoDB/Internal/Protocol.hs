@@ -18,7 +18,7 @@
 #endif
 
 module Database.MongoDB.Internal.Protocol (
-    FullCollection,
+    FullCollection(..),
     -- * Pipe
     Pipe,  newPipe, newPipeWith, send, sendOpMsg, call, callOpMsg,
     -- ** Notice
@@ -272,23 +272,19 @@ callOpMsg pipe request flagBit params = do
    -- headers will reference the cursorId that was set in the previous message.
    -- see:
    -- https://github.com/mongodb/specifications/blob/master/source/message/OP_MSG.rst#moretocome-on-responses
-    checkFlagBit p =
-      case p of
-        (_, r) ->
-          case r of
-            ReplyOpMsg{..} -> flagBits == [MoreToCome]
-             -- This is called by functions using the OP_MSG protocol,
-             -- so this has to be ReplyOpMsg
-            _ -> error "Impossible"
-    produce reqId p = runConduit $
-      case p of
-        (rt, r) ->
-          case r of
-              ReplyOpMsg{..} ->
-                if flagBits == [MoreToCome]
-                  then yieldResponses .| foldlC mergeResponses p
-                  else return $ (rt, check reqId p)
-              _ -> error "Impossible" -- see comment above
+    checkFlagBit (_, r) =
+      case r of
+        ReplyOpMsg{..} -> flagBits == [MoreToCome]
+         -- This is called by functions using the OP_MSG protocol,
+         -- so this has to be ReplyOpMsg
+        _ -> error "checkFlagBit: Impossible"
+    produce reqId p@(rt,r) = runConduit $
+      case r of
+          ReplyOpMsg{..} ->
+            if flagBits == [MoreToCome]
+              then yieldResponses .| foldlC mergeResponses p
+              else return $ (rt, check reqId p)
+          _ -> error "produce: Impossible" -- see comment above
     yieldResponses = repeatWhileMC
           (do
              var <- newEmptyMVar
@@ -296,27 +292,28 @@ callOpMsg pipe request flagBit params = do
              readMVar var >>= either throwIO return :: IO Response
           )
           checkFlagBit
-    mergeResponses p@(rt,rep) p' =
-      case (p, p') of
-          ((_, r), (_, r')) ->
-            case (r, r') of
-                (ReplyOpMsg _ sec _, ReplyOpMsg _ sec' _) -> do
-                    let (section, section') = (head sec, head sec')
-                        (cur, cur') = (maybe Nothing cast $ look "cursor" section,
-                                      maybe Nothing cast $ look "cursor" section')
-                    case (cur, cur') of
-                      (Just doc, Just doc') -> do
+    mergeResponses p@(rt,rep) (_,r') = case (rep, r') of
+        (ReplyOpMsg _ sec _, ReplyOpMsg _ sec' _) -> case (sec,sec') of
+            (section:_,section':_) ->
+                let (cur, cur') = (maybe Nothing cast $ look "cursor" section,
+                                  maybe Nothing cast $ look "cursor" section')
+                in case (cur, cur') of
+                    (Just doc, Just doc') -> do
                         let (docs, docs') =
                               ( fromJust $ cast $ valueAt "nextBatch" doc :: [Document]
                               , fromJust $ cast $ valueAt "nextBatch" doc' :: [Document])
-                            id' = fromJust $ cast $ valueAt "id" doc' :: Int32
-                        (rt, check id' (rt, rep{ sections = docs' ++ docs })) -- todo: avoid (++)
+                            id' = fromJust $ cast $ valueAt "id" doc :: CursorId
+                            id'' = fromJust $ cast $ valueAt "id" doc' :: CursorId
+                        checkCursorId id' id'' (rt, rep{ sections = docs' ++ docs })
                         -- Since we use this to process moreToCome messages, we
                         -- know that there will be a nextBatch key in the document
-                      _ ->  error "Impossible"
-                _ -> error "Impossible" -- see comment above
+                    (_,Nothing) -> error "mergeResponses: Nothing as second Impossible"
+                    (Nothing,_) -> p
+            _ -> error "mergeResponses: no sections in response"
+        _ -> error "mergeResponses: not ReplyOpMsg Impossible" -- see comment above
     check requestId (responseTo, reply) = if requestId == responseTo then reply else
         error $ "expected response id (" ++ show responseTo ++ ") to match request id (" ++ show requestId ++ ")"
+    checkCursorId a b = if a == b then id else error $ "expected cursor ids (" ++ show a <> " " <> show b ++ ")"
 
 -- * Message
 
@@ -374,7 +371,6 @@ readMessage conn = readResp  where
         runGet getReply . L.fromStrict <$> Tr.read conn len
     decodeSize = subtract 4 . runGet getInt32
 
-type FullCollection = Text
 -- ^ Database name and collection name with period (.) in between. Eg. \"myDb.myCollection\"
 
 -- ** Header
@@ -466,17 +462,17 @@ putNotice notice requestId = do
     case notice of
         Insert{..} -> do
             putInt32 (iBits iOptions)
-            putCString iFullCollection
+            putCString $ fullCollectionToText iFullCollection
             mapM_ putDocument iDocuments
         Update{..} -> do
             putInt32 0
-            putCString uFullCollection
+            putCString $ fullCollectionToText uFullCollection
             putInt32 (uBits uOptions)
             putDocument uSelector
             putDocument uUpdater
         Delete{..} -> do
             putInt32 0
-            putCString dFullCollection
+            putCString $ fullCollectionToText dFullCollection
             putInt32 (dBits dOptions)
             putDocument dSelector
         KillCursors{..} -> do
@@ -568,15 +564,13 @@ putOpMsg cmd requestId flagBit params = do
             _ -> error "The KillCursors command cannot be wrapped into a Nc type constructor. Please use the Kc type constructor"
         Req r -> case r of
             Query{..} -> do
-                let n = T.splitOn "." qFullCollection
-                    db = head n
-                    sec0 = foldl1' merge [qProjector, [ "$db" =: db ], qSelector]
+                let sec0 = foldl1' merge [qProjector, [ "$db" =: fDatabase qFullCollection ], qSelector]
                 putInt32 biT
                 putInt8 0
                 putDocument sec0
             GetMore{..} -> do
-                let n = T.splitOn "." gFullCollection
-                    (db, coll) = (head n, last n)
+                let coll = fCollection gFullCollection
+                    db = fDatabase gFullCollection
                     pre = ["getMore" =: gCursorId, "collection" =: coll, "$db" =: db, "batchSize" =: gBatchSize]
                 putInt32 (bit $ bitOpMsg $ ExhaustAllowed)
                 putInt8 0
@@ -587,8 +581,8 @@ putOpMsg cmd requestId flagBit params = do
                 putDocument $ merge [ "$db" =: mDatabase ] mParams
         Kc k -> case k of
             KillC{..} -> do
-                let n = T.splitOn "." kFullCollection
-                    (db, coll) = (head n, last n)
+                let coll = fCollection kFullCollection
+                    db = fDatabase kFullCollection
                 case killCursor of
                   KillCursors{..} -> do
                       let doc = ["killCursors" =: coll, "cursors" =: kCursorIds, "$db" =: db]
@@ -601,8 +595,8 @@ putOpMsg cmd requestId flagBit params = do
  where
     lenBytes bytes = toEnum . fromEnum $ L.length bytes:: Int32
     prepSectionInfo fullCollection documents document command identifier ps =
-      let n = T.splitOn "." fullCollection
-          (db, coll) = (head n, last n)
+      let db = fDatabase fullCollection
+          coll = fCollection fullCollection
       in
       case documents of
         Just ds ->
@@ -647,6 +641,15 @@ bitOpMsg MoreToCome = 1
 bitOpMsg ExhaustAllowed = 16
 
 -- ** Request
+
+data FullCollection = FullCollection
+    { fDatabase   :: Text
+    , fCollection :: Text
+    }
+    deriving (Show,Eq)
+
+fullCollectionToText :: FullCollection -> Text
+fullCollectionToText a = fDatabase a <> "." <> fCollection a
 
 -- | A request is a message that is sent with a 'Reply' expected in return
 data Request =
@@ -695,14 +698,14 @@ putRequest request requestId = do
     case request of
         Query{..} -> do
             putInt32 (qBits qOptions)
-            putCString qFullCollection
+            putCString $ fullCollectionToText qFullCollection
             putInt32 qSkip
             putInt32 qBatchSize
             putDocument qSelector
             unless (null qProjector) (putDocument qProjector)
         GetMore{..} -> do
             putInt32 0
-            putCString gFullCollection
+            putCString $ fullCollectionToText gFullCollection
             putInt32 gBatchSize
             putInt64 gCursorId
         Message{..} -> do

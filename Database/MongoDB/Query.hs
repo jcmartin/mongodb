@@ -109,7 +109,7 @@ import Data.Word (Word32)
 import Database.MongoDB.Internal.Protocol
   ( CursorId,
     DeleteOption (..),
-    FullCollection,
+    FullCollection(..),
     InsertOption (..),
     Notice (..),
     Password,
@@ -593,7 +593,7 @@ insertBlock opts col (prevCount, docs) = do
     let sd = P.serverData p
     if maxWireVersion sd < 2
       then do
-        res <- liftDB $ write (Insert (db <.> col) opts docs)
+        res <- liftDB $ write (Insert (FullCollection db col) opts docs)
         let errorMessage = do
               jRes <- res
               em <- lookup "err" jRes
@@ -739,12 +739,12 @@ update opts (Select sel col) up = do
     if maxWireVersion sd < 17
       then do
         ctx <- ask
-        liftIO $ runReaderT (void $ write (Update (db <.> col) opts sel up)) ctx
+        liftIO $ runReaderT (void $ write (Update (FullCollection db col) opts sel up)) ctx
       else do
         liftIOE ConnectionFailure $
           P.sendOpMsg
             pipe
-            [Nc (Update (db <.> col) opts sel up)]
+            [Nc (Update (FullCollection db col) opts sel up)]
             (Just P.MoreToCome)
             ["writeConcern" =: ["w" =: (0 :: Int32)]]
 
@@ -1032,7 +1032,7 @@ deleteOne sel@((Select sel' col)) = do
         liftIOE ConnectionFailure $
           P.sendOpMsg
             pipe
-            [Nc (Delete (db <.> col) [] sel')]
+            [Nc (Delete (FullCollection db col) [] sel')]
             (Just P.MoreToCome)
             ["writeConcern" =: ["w" =: (0 :: Int32)]]
 
@@ -1041,7 +1041,7 @@ deleteHelper :: (MonadIO m)
 deleteHelper opts (Select sel col) = do
     ctx <- ask
     db <- thisDatabase
-    liftIO $ runReaderT (void $ write (Delete (db <.> col) opts sel)) ctx
+    liftIO $ runReaderT (void $ write (Delete (FullCollection db col) opts sel)) ctx
 
 {-| Bulk delete operation. If one delete fails it will not delete the remaining
     documents. Current returned value is only a place holder. With mongodb server
@@ -1317,7 +1317,7 @@ find q@Query{selection, batchSize} = do
         let newQr =
               case fst qr of
                 Req P.Query{..} ->
-                  let coll = last $ T.splitOn "." qFullCollection
+                  let coll = fCollection qFullCollection
                   in (Req $ P.Query {qSelector = merge qSelector [ "find" =: coll ], ..}, snd qr)
                 -- queryRequestOpMsg only returns Cmd types constructed via Req
                 _ -> error "impossible"
@@ -1379,7 +1379,7 @@ findOne q = do
             let newQr =
                   case fst qr of
                     Req P.Query{..} ->
-                      let coll = last $ T.splitOn "." qFullCollection
+                      let coll = fCollection qFullCollection
                           -- We have to understand whether findOne is called as
                           -- command directly. This is necessary since findOne is used via
                           -- runCommand as a vehicle to execute any type of commands and notices.
@@ -1505,7 +1505,7 @@ queryRequest isExplain Query{..} = do
  where
     queryRequest' rm db = (P.Query{..}, remainingLimit) where
         qOptions = readModeOption rm ++ options
-        qFullCollection = db <.> coll selection
+        qFullCollection = FullCollection db $ coll selection
         qSkip = fromIntegral skip
         (qBatchSize, remainingLimit) = batchSizeRemainingLimit batchSize (if limit == 0 then Nothing else Just limit)
         qProjector = project
@@ -1524,7 +1524,7 @@ queryRequestOpMsg isExplain Query{..} = do
  where
     queryRequest' rm db = (Req P.Query{..}, remainingLimit) where
         qOptions = readModeOption rm ++ options
-        qFullCollection = db <.> coll selection
+        qFullCollection = FullCollection db $ coll selection
         qSkip = fromIntegral skip
         (qBatchSize, remainingLimit) = batchSizeRemainingLimit batchSize (if limit == 0 then Nothing else Just limit)
         -- Check whether this query is not a command in disguise. If
@@ -1626,7 +1626,7 @@ newCursor :: MonadIO m => Database -> Collection -> BatchSize -> DelayedBatch ->
 -- ^ Create new cursor. If you don't read all results then close it. Cursor will be closed automatically when all results are read from it or when eventually garbage collected.
 newCursor db col batchSize dBatch = do
     var <- liftIO $ MV.newMVar dBatch
-    let cursor = Cursor (db <.> col) batchSize var
+    let cursor = Cursor (FullCollection db col) batchSize var
     _ <- liftDB $ mkWeakMVar var (closeCursor cursor)
     return cursor
 

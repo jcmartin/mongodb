@@ -1310,7 +1310,7 @@ find q@Query{selection, batchSize} = do
         (P.Query{..},limit') <- queryRequestOpMsg False q
         let qColl = fCollection qFullCollection
         let newQr = P.Query {qSelector = merge qSelector [ "find" =: qColl ], ..}
-        dBatch <- liftIO $ requestOpMsg pipe (Req $ P.QueryReq newQr,limit') []
+        dBatch <- liftIO $ requestOpMsg pipe (P.QueryReq newQr,limit') []
         newCursor db (coll selection) batchSize dBatch
 
 findCommand :: (MonadIO m) => Query -> Action m Cursor
@@ -1373,7 +1373,7 @@ findOne q = do
             let newQr = if null labels
                            then P.Query {qSelector = merge qSelector [ "find" =: coll ], ..}
                            else qr
-            rq <- liftIO $ requestOpMsg pipe (Req $ P.QueryReq newQr,limit') []
+            rq <- liftIO $ requestOpMsg pipe (P.QueryReq newQr,limit') []
             Batch _ _ docs <- liftDB $ fulfill rq
             return (listToMaybe docs)
 
@@ -1557,15 +1557,14 @@ request pipe ns (req, remainingLimit) = do
     return $ fromReply remainingLimit =<< protectedPromise
 
 requestOpMsgQuery :: Pipe -> (P.Query, Maybe Limit) -> Document -> IO DelayedBatch
-requestOpMsgQuery pipe (q,limit') = requestOpMsg pipe (Req $ P.QueryReq q,limit')
+requestOpMsgQuery pipe (q,limit') = requestOpMsg pipe (P.QueryReq q,limit')
 
-requestOpMsg :: Pipe -> (Cmd, Maybe Limit) -> Document -> IO DelayedBatch
+requestOpMsg :: Pipe -> (P.Request, Maybe Limit) -> Document -> IO DelayedBatch
 -- ^ Send notices and request and return promised batch
-requestOpMsg pipe (Req r, remainingLimit) params = do
+requestOpMsg pipe (r, remainingLimit) params = do
   promise <- liftIOE ConnectionFailure $ P.callOpMsg pipe r Nothing params
   let protectedPromise = liftIOE ConnectionFailure promise
   return $ fromReply remainingLimit =<< protectedPromise
-requestOpMsg _ _ _ = error "requestOpMsg: Only messages of type Query are supported"
 
 fromReply :: Maybe Limit -> Reply -> DelayedBatch
 -- ^ Convert Reply to Batch or Failure
@@ -1654,7 +1653,7 @@ nextBatch' fcol batchSize limit cid = do
     let sd = P.serverData pipe
     if maxWireVersion sd < 17
       then liftIO $ request pipe [] (GetMore fcol batchSize' cid, remLimit)
-      else liftIO $ requestOpMsg pipe (Req $ GetMore fcol batchSize' cid, remLimit) []
+      else liftIO $ requestOpMsg pipe (GetMore fcol batchSize' cid, remLimit) []
     where (batchSize', remLimit) = batchSizeRemainingLimit batchSize limit
 
 next :: MonadIO m => Cursor -> Action m (Maybe Document)
@@ -1909,7 +1908,7 @@ runCommandLegacy pipe params = do
 runCommand' :: MonadIO m => Pipe -> Selector -> ReaderT MongoContext m Document
 runCommand' pipe params = do
     ctx <- ask
-    rq <- liftIO $ requestOpMsg pipe ( Req (P.Message (mongoDatabase ctx) params), Just 1) []
+    rq <- liftIO $ requestOpMsg pipe (P.Message (mongoDatabase ctx) params, Just 1) []
     Batch _ _ docs <- liftDB $ fulfill rq
     case docs of
       [doc] -> pure doc

@@ -1689,7 +1689,7 @@ next (Cursor fcol batchSize var) = liftDB $ modifyMVar var nextState where
                       let sd = P.serverData pipe
                       if maxWireVersion sd < 17
                         then liftIOE ConnectionFailure $ P.send pipe [KillCursors [cid]]
-                        else liftIOE ConnectionFailure $ P.sendOpMsg pipe [Kc (P.KillC (KillCursors [cid]) fcol)] (Just MoreToCome) []
+                        else liftIOE ConnectionFailure $ P.sendOpMsg pipe [Kc (P.KillC [cid] fcol)] (Just MoreToCome) []
                     return (dBatch', Just doc)
                 [] -> if cid == 0
                     then return (return $ Batch (Just 0) 0 [], Nothing)  -- finished

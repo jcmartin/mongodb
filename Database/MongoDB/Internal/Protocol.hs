@@ -480,7 +480,7 @@ putNotice notice requestId = do
             putInt32 $ toEnum (length kCursorIds)
             mapM_ putInt64 kCursorIds
 
-data KillC = KillC { killCursor :: Notice, kFullCollection:: FullCollection} deriving Show
+data KillC = KillC { killCursorIds :: [CursorId], kFullCollection:: FullCollection} deriving Show
 
 data Cmd = Nc Notice | Req Request | Kc KillC deriving Show
 
@@ -579,19 +579,13 @@ putOpMsg cmd requestId flagBit params = do
                 putInt32 biT
                 putInt8 0
                 putDocument $ merge [ "$db" =: mDatabase ] mParams
-        Kc k -> case k of
-            KillC{..} -> do
-                let coll = fCollection kFullCollection
-                    db = fDatabase kFullCollection
-                case killCursor of
-                  KillCursors{..} -> do
-                      let doc = ["killCursors" =: coll, "cursors" =: kCursorIds, "$db" =: db]
-                      putInt32 biT
-                      putInt8 0
-                      putDocument doc
-                  -- Notices are already captured at the beginning, so all
-                  -- other cases are impossible
-                  _ -> error "impossible"
+        Kc KillC{..} -> do
+            let coll = fCollection kFullCollection
+            let db = fDatabase kFullCollection
+            let doc = ["killCursors" =: coll, "cursors" =: killCursorIds, "$db" =: db]
+            putInt32 biT
+            putInt8 0
+            putDocument doc
  where
     lenBytes bytes = toEnum . fromEnum $ L.length bytes:: Int32
     prepSectionInfo fullCollection documents document command identifier ps =

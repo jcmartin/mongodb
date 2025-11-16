@@ -25,6 +25,7 @@ module Database.MongoDB.Internal.Protocol (
     Notice(..), InsertOption(..), UpdateOption(..), DeleteOption(..), CursorId,
     -- ** Request
     Request(..), QueryOption(..), Cmd (..), KillC(..),
+    Query(..),
     -- ** Reply
     Reply(..), ResponseFlag(..), FlagBit(..),
     -- * Authentication
@@ -563,7 +564,7 @@ putOpMsg cmd requestId flagBit params = do
                 putDocument doc
             _ -> error "The KillCursors command cannot be wrapped into a Nc type constructor. Please use the Kc type constructor"
         Req r -> case r of
-            Query{..} -> do
+            QueryReq Query{..} -> do
                 let sec0 = foldl1' merge [qProjector, [ "$db" =: fDatabase qFullCollection ], qSelector]
                 putInt32 biT
                 putInt8 0
@@ -645,16 +646,20 @@ data FullCollection = FullCollection
 fullCollectionToText :: FullCollection -> Text
 fullCollectionToText a = fDatabase a <> "." <> fCollection a
 
+data Query = Query
+    { qOptions :: [QueryOption]
+    , qFullCollection :: FullCollection
+    , qSkip :: Int32  -- ^ Number of initial matching documents to skip
+    , qBatchSize :: Int32  -- ^ The number of document to return in each batch response from the server. 0 means use Mongo default. Negative means close cursor after first batch and use absolute value as batch size.
+    , qSelector :: Document  -- ^ @[]@ = return all documents in collection
+    , qProjector :: Document  -- ^ @[]@ = return whole document
+    }
+    deriving (Show,Eq)
+
 -- | A request is a message that is sent with a 'Reply' expected in return
-data Request =
-      Query {
-        qOptions :: [QueryOption],
-        qFullCollection :: FullCollection,
-        qSkip :: Int32,  -- ^ Number of initial matching documents to skip
-        qBatchSize :: Int32,  -- ^ The number of document to return in each batch response from the server. 0 means use Mongo default. Negative means close cursor after first batch and use absolute value as batch size.
-        qSelector :: Document,  -- ^ @[]@ = return all documents in collection
-        qProjector :: Document  -- ^ @[]@ = return whole document
-    } | GetMore {
+data Request
+    = QueryReq Query
+    | GetMore {
         gFullCollection :: FullCollection,
         gBatchSize :: Int32,
         gCursorId :: CursorId
@@ -679,7 +684,7 @@ data QueryOption =
 -- *** Binary format
 
 qOpcode :: Request -> Opcode
-qOpcode Query{} = 2004
+qOpcode QueryReq{} = 2004
 qOpcode GetMore{} = 2005
 qOpcode Message{} = 2013
 
@@ -690,7 +695,7 @@ putRequest :: Request -> RequestId -> Put
 putRequest request requestId = do
     putHeader (qOpcode request) requestId
     case request of
-        Query{..} -> do
+        QueryReq Query{..} -> do
             putInt32 (qBits qOptions)
             putCString $ fullCollectionToText qFullCollection
             putInt32 qSkip

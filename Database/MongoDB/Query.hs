@@ -117,13 +117,7 @@ import Database.MongoDB.Internal.Protocol
     QueryOption (..),
     Reply (..),
     Request
-      ( GetMore,
-        qBatchSize,
-        qFullCollection,
-        qOptions,
-        qProjector,
-        qSelector,
-        qSkip
+      ( GetMore
       ),
     ResponseFlag (..),
     ServerData (..),
@@ -435,7 +429,7 @@ allCollections = do
           else do
             let q = Query [] (Select ["listCollections" =: (1 :: Int)] "$cmd") [] 0 0 [] False 0 []
             qr <- queryRequestOpMsg False q
-            dBatch <- liftIO $ requestOpMsg p qr []
+            dBatch <- liftIO $ requestOpMsgQuery p qr []
             db <- thisDatabase
             nc <- newCursor db "$cmd" 0 dBatch
             docs <- rest nc
@@ -485,7 +479,7 @@ write notice = asks mongoWriteMode >>= \mode -> case mode of
         pipe <- asks mongoPipe
         Batch _ _ [doc] <- do
           r <- queryRequest False q {limit = 1}
-          rr <- liftIO $ request pipe [notice] r
+          rr <- liftIO $ requestQuery pipe [notice] r
           fulfill rr
         return $ Just doc
 
@@ -1310,18 +1304,13 @@ find q@Query{selection, batchSize} = do
     if maxWireVersion sd < 17
       then do
         qr <- queryRequest False q
-        dBatch <- liftIO $ request pipe [] qr
+        dBatch <- liftIO $ requestQuery pipe [] qr
         newCursor db (coll selection) batchSize dBatch
       else do
-        qr <- queryRequestOpMsg False q
-        let newQr =
-              case fst qr of
-                Req P.Query{..} ->
-                  let coll = fCollection qFullCollection
-                  in (Req $ P.Query {qSelector = merge qSelector [ "find" =: coll ], ..}, snd qr)
-                -- queryRequestOpMsg only returns Cmd types constructed via Req
-                _ -> error "impossible"
-        dBatch <- liftIO $ requestOpMsg pipe newQr []
+        (P.Query{..},limit') <- queryRequestOpMsg False q
+        let qColl = fCollection qFullCollection
+        let newQr = P.Query {qSelector = merge qSelector [ "find" =: qColl ], ..}
+        dBatch <- liftIO $ requestOpMsg pipe (Req $ P.QueryReq newQr,limit') []
         newCursor db (coll selection) batchSize dBatch
 
 findCommand :: (MonadIO m) => Query -> Action m Cursor
@@ -1365,7 +1354,7 @@ findOne q = do
     pipe <- asks mongoPipe
     let legacyQuery = do
             qr <- queryRequest False q {limit = 1}
-            rq <- liftIO $ request pipe [] qr
+            rq <- liftIO $ requestQuery pipe [] qr
             Batch _ _ docs <- liftDB $ fulfill rq
             return (listToMaybe docs)
     if isHandshake (selector $ selection q)
@@ -1375,20 +1364,16 @@ findOne q = do
         if (maxWireVersion sd < 17)
           then legacyQuery
           else do
-            qr <- queryRequestOpMsg False q {limit = 1}
-            let newQr =
-                  case fst qr of
-                    Req P.Query{..} ->
-                      let coll = fCollection qFullCollection
-                          -- We have to understand whether findOne is called as
-                          -- command directly. This is necessary since findOne is used via
-                          -- runCommand as a vehicle to execute any type of commands and notices.
-                          labels = catMaybes $ map (\f -> look f qSelector) (noticeCommands ++ adminCommands) :: [Value]
-                      in if null labels
-                           then (Req P.Query {qSelector = merge qSelector [ "find" =: coll ], ..}, snd qr)
+            (qr@P.Query{..},limit') <- queryRequestOpMsg False q {limit = 1}
+            let coll = fCollection qFullCollection
+            -- We have to understand whether findOne is called as
+            -- command directly. This is necessary since findOne is used via
+            -- runCommand as a vehicle to execute any type of commands and notices.
+            let labels = catMaybes $ map (\f -> look f qSelector) (noticeCommands ++ adminCommands) :: [Value]
+            let newQr = if null labels
+                           then P.Query {qSelector = merge qSelector [ "find" =: coll ], ..}
                            else qr
-                    _ -> error "impossible"
-            rq <- liftIO $ requestOpMsg pipe newQr []
+            rq <- liftIO $ requestOpMsg pipe (Req $ P.QueryReq newQr,limit') []
             Batch _ _ docs <- liftDB $ fulfill rq
             return (listToMaybe docs)
 
@@ -1481,7 +1466,7 @@ explain :: (MonadIO m) => Query -> Action m Document
 explain q = do  -- same as findOne but with explain set to true
     pipe <- asks mongoPipe
     qr <- queryRequest True q {limit = 1}
-    r <- liftIO $ request pipe [] qr
+    r <- liftIO $ requestQuery pipe [] qr
     Batch _ _ docs <- liftDB $ fulfill r
     case docs of
         [] -> error ("no explain: " ++ show q)
@@ -1497,7 +1482,7 @@ distinct :: (MonadIO m) => Label -> Selection -> Action m [Value]
 -- ^ Fetch distinct values of field in selected documents
 distinct k (Select sel col) = at "values" <$> runCommand ["distinct" =: col, "key" =: k, "query" =: sel]
 
-queryRequest :: (Monad m, MonadIO m) => Bool -> Query -> Action m (Request, Maybe Limit)
+queryRequest :: (Monad m, MonadIO m) => Bool -> Query -> Action m (P.Query, Maybe Limit)
 -- ^ Translate Query to Protocol.Query. If first arg is true then add special $explain attribute.
 queryRequest isExplain Query{..} = do
     ctx <- ask
@@ -1516,13 +1501,13 @@ queryRequest isExplain Query{..} = do
         special = catMaybes [mOrder, mSnapshot, mHint, mExplain]
         qSelector = if null special then s else ("$query" =: s) : special where s = selector selection
 
-queryRequestOpMsg :: (Monad m, MonadIO m) => Bool -> Query -> Action m (Cmd, Maybe Limit)
+queryRequestOpMsg :: (Monad m, MonadIO m) => Bool -> Query -> Action m (P.Query, Maybe Limit)
 -- ^ Translate Query to Protocol.Query. If first arg is true then add special $explain attribute.
 queryRequestOpMsg isExplain Query{..} = do
     ctx <- ask
     return $ queryRequest' (mongoReadMode ctx) (mongoDatabase ctx)
  where
-    queryRequest' rm db = (Req P.Query{..}, remainingLimit) where
+    queryRequest' rm db = (P.Query{..}, remainingLimit) where
         qOptions = readModeOption rm ++ options
         qFullCollection = FullCollection db $ coll selection
         qSkip = fromIntegral skip
@@ -1561,12 +1546,18 @@ type DelayedBatch = IO Batch
 data Batch = Batch (Maybe Limit) CursorId [Document]
 -- ^ CursorId = 0 means cursor is finished. Documents is remaining documents to serve in current batch. Limit is number of documents to return. Nothing means no limit.
 
+requestQuery :: Pipe -> [Notice] -> (P.Query,Maybe Limit) -> IO DelayedBatch
+requestQuery pipe ns (q,limit') = request pipe ns (P.QueryReq q,limit')
+
 request :: Pipe -> [Notice] -> (Request, Maybe Limit) -> IO DelayedBatch
 -- ^ Send notices and request and return promised batch
 request pipe ns (req, remainingLimit) = do
     promise <- liftIOE ConnectionFailure $ P.call pipe ns req
     let protectedPromise = liftIOE ConnectionFailure promise
     return $ fromReply remainingLimit =<< protectedPromise
+
+requestOpMsgQuery :: Pipe -> (P.Query, Maybe Limit) -> Document -> IO DelayedBatch
+requestOpMsgQuery pipe (q,limit') = requestOpMsg pipe (Req $ P.QueryReq q,limit')
 
 requestOpMsg :: Pipe -> (Cmd, Maybe Limit) -> Document -> IO DelayedBatch
 -- ^ Send notices and request and return promised batch
@@ -1759,7 +1750,7 @@ aggregateCursor aColl agg cfg = do
       else do
         let q = select (aggregateCommand aColl agg cfg) aColl
         qr <- queryRequestOpMsg False q
-        dBatch <- liftIO $ requestOpMsg pipe qr []
+        dBatch <- liftIO $ requestOpMsgQuery pipe qr []
         db <- thisDatabase
         Right <$> newCursor db aColl 0 dBatch
            >>= either (liftIO . throwIO . AggregateFailure) return
@@ -1909,7 +1900,7 @@ runCommand params = do
 runCommandLegacy :: MonadIO m => Pipe -> Selector -> ReaderT MongoContext m Document
 runCommandLegacy pipe params = do
     qr <- queryRequest False (query params "$cmd") {limit = 1}
-    rq <- liftIO $ request pipe [] qr
+    rq <- liftIO $ requestQuery pipe [] qr
     Batch _ _ docs <- liftDB $ fulfill rq
     case docs of
       [doc] -> pure doc

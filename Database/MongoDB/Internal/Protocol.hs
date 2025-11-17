@@ -5,6 +5,7 @@
 -- "Database.MongoDB.Query" and "Database.MongoDB.Connection" instead.
 
 {-# LANGUAGE RecordWildCards, OverloadedStrings #-}
+{-# LANGUAGE GADTs, KindSignatures, StandaloneDeriving, DataKinds #-}
 {-# LANGUAGE CPP, FlexibleContexts #-}
 {-# LANGUAGE MultiParamTypeClasses, FlexibleInstances, UndecidableInstances #-}
 {-# LANGUAGE BangPatterns #-}
@@ -23,6 +24,7 @@ module Database.MongoDB.Internal.Protocol (
     Pipe,  newPipe, newPipeWith, send, sendOpMsg, call, callOpMsg,
     -- ** Notice
     Notice(..), InsertOption(..), UpdateOption(..), DeleteOption(..), CursorId,
+    InOpMsg(..),
     -- ** Request
     Request(..), QueryOption(..), Cmd (..), KillC(..),
     Query(..),
@@ -43,6 +45,7 @@ import Data.Binary.Put (Put, runPut, putInt8)
 import Data.Bits (bit, testBit, zeroBits)
 import Data.Int (Int32, Int64)
 import Data.IORef (IORef, newIORef, atomicModifyIORef)
+import Data.List.NonEmpty(NonEmpty,toList)
 import System.IO (Handle)
 import System.IO.Error (doesNotExistErrorType, mkIOError)
 import System.IO.Unsafe (unsafePerformIO)
@@ -179,7 +182,7 @@ listen Pipeline{..} = do
             Left err -> Tr.close stream >> ioError err  -- close and stop looping
             Right _ -> return ()
 
-psend :: Pipeline -> Message -> IO ()
+psend :: Pipeline -> Message k -> IO ()
 -- ^ Send message to destination; the destination must not response (otherwise future 'call's will get these responses instead of their own).
 -- Throw IOError and close pipeline if send fails
 psend p@Pipeline{..} !message = withMVar vStream (flip writeMessage message) `onException` close p
@@ -192,7 +195,7 @@ psendOpMsg p@Pipeline{..} commands flagBit params =
                _ -> error "moreToCome has to be set if no response is expected"
     _ -> error "moreToCome has to be set if no response is expected"
 
-pcall :: Pipeline -> Message -> IO (IO Response)
+pcall :: Pipeline -> Message k -> IO (IO Response)
 -- ^ Send message to destination and return /promise/ of response from one message only. The destination must reply to the message (otherwise promises will have the wrong responses in them).
 -- Throw IOError and closes pipeline if send fails, likewise for promised response.
 pcall p@Pipeline{..} message = do
@@ -238,17 +241,15 @@ newPipeWith :: ServerData -> Transport -> IO Pipe
 -- ^ Create pipe over connection
 newPipeWith sd conn = newPipeline sd conn
 
-send :: Pipe -> [Notice] -> IO ()
+send :: Pipe -> [Notice k] -> IO ()
 -- ^ Send notices as a contiguous batch to server with no reply. Throw IOError if connection fails.
 send pipe notices = psend pipe (notices, Nothing)
 
-sendOpMsg :: Pipe -> [Cmd] -> Maybe FlagBit -> Document -> IO ()
+sendOpMsg :: Pipe -> NonEmpty Cmd -> Maybe FlagBit -> Document -> IO ()
 -- ^ Send notices as a contiguous batch to server with no reply. Throw IOError if connection fails.
-sendOpMsg pipe commands@(Nc _ : _) flagBit params =  psendOpMsg pipe commands flagBit params
-sendOpMsg pipe commands@(Kc _ : _) flagBit params =  psendOpMsg pipe commands flagBit params
-sendOpMsg _ _ _ _ =  error "This function only supports Cmd types wrapped in Nc or Kc type constructors"
+sendOpMsg pipe commands =  psendOpMsg pipe $ toList commands
 
-call :: Pipe -> [Notice] -> Request -> IO (IO Reply)
+call :: Pipe -> [Notice k] -> Request -> IO (IO Reply)
 -- ^ Send notices and request as a contiguous batch to server and return reply promise, which will block when invoked until reply arrives. This call and resulting promise will throw IOError if connection fails.
 call pipe notices request = do
     requestId <- genRequestId
@@ -318,12 +319,12 @@ callOpMsg pipe request flagBit params = do
 
 -- * Message
 
-type Message = ([Notice], Maybe (Request, RequestId))
+type Message k = ([Notice k], Maybe (Request, RequestId))
 -- ^ A write notice(s) with getLastError request, or just query request.
 -- Note, that requestId will be out of order because request ids will be generated for notices after the request id supplied was generated. This is ok because the mongo server does not care about order just uniqueness.
 type OpMsgMessage = ([Cmd], Maybe (Request, RequestId))
 
-writeMessage :: Transport -> Message -> IO ()
+writeMessage :: Transport -> Message k -> IO ()
 -- ^ Write message to connection
 writeMessage conn (notices, mRequest) = do
     noticeStrings <- forM notices $ \n -> do
@@ -352,7 +353,7 @@ writeOpMsgMessage conn (notices, mRequest) flagBit params = do
 
     let requestString = do
            (request, requestId) <- mRequest
-           let s = runPut $ putOpMsg (Req request) requestId flagBit params
+           let s = runPut $ putOpMsgRequest request requestId flagBit
            return $ (lenBytes s) `L.append` s
 
     Tr.write conn $ L.toStrict $ L.concat $ noticeStrings ++ (maybeToList requestString)
@@ -417,24 +418,27 @@ getHeader = do
 
 -- ** Notice
 
+data InOpMsg = InMsg | InOpMsg
+
 -- | A notice is a message that is sent with no reply
-data Notice =
-      Insert {
+data Notice (k :: InOpMsg) where
+    Insert :: {
         iFullCollection :: FullCollection,
         iOptions :: [InsertOption],
-        iDocuments :: [Document]}
-    | Update {
+        iDocuments :: [Document]} -> Notice k
+    Update :: {
         uFullCollection :: FullCollection,
         uOptions :: [UpdateOption],
         uSelector :: Document,
-        uUpdater :: Document}
-    | Delete {
+        uUpdater :: Document} -> Notice k
+    Delete :: {
         dFullCollection :: FullCollection,
         dOptions :: [DeleteOption],
-        dSelector :: Document}
-    | KillCursors {
-        kCursorIds :: [CursorId]}
-    deriving (Show, Eq)
+        dSelector :: Document} -> Notice k
+    KillCursors :: {
+        kCursorIds :: [CursorId]} -> Notice 'InOpMsg
+deriving instance Show (Notice k)
+deriving instance Eq (Notice k)
 
 data InsertOption = KeepGoing  -- ^ If set, the database will not stop processing a bulk insert if one fails (eg due to duplicate IDs). This makes bulk insert behave similarly to a series of single inserts, except lastError will be set if any insert fails, not just the last one. (new in 1.9.1)
     deriving (Show, Eq)
@@ -451,13 +455,13 @@ type CursorId = Int64
 
 -- *** Binary format
 
-nOpcode :: Notice -> Opcode
+nOpcode :: Notice k -> Opcode
 nOpcode Update{} = 2001
 nOpcode Insert{} = 2002
 nOpcode Delete{} = 2006
 nOpcode KillCursors{} = 2007
 
-putNotice :: Notice -> RequestId -> Put
+putNotice :: Notice k -> RequestId -> Put
 putNotice notice requestId = do
     putHeader (nOpcode notice) requestId
     case notice of
@@ -483,7 +487,7 @@ putNotice notice requestId = do
 
 data KillC = KillC { killCursorIds :: [CursorId], kFullCollection:: FullCollection} deriving Show
 
-data Cmd = Nc Notice | Req Request | Kc KillC deriving Show
+data Cmd = Nc (Notice 'InMsg) | Kc KillC deriving Show
 
 data FlagBit =
       ChecksumPresent  -- ^ The message ends with 4 bytes containing a CRC-32C checksum
@@ -494,6 +498,9 @@ data FlagBit =
 uOptDoc :: UpdateOption -> Document
 uOptDoc Upsert = ["upsert" =: True]
 uOptDoc MultiUpdate = ["multi" =: True]
+
+mkFlagBitWord :: Maybe FlagBit -> Int32
+mkFlagBitWord = maybe zeroBits (bit . bitOpMsg)
 
 {-
   OP_MSG header == 16 byte
@@ -507,7 +514,7 @@ uOptDoc MultiUpdate = ["multi" =: True]
 -}
 putOpMsg :: Cmd -> RequestId -> Maybe FlagBit -> Document -> Put
 putOpMsg cmd requestId flagBit params = do
-    let biT = maybe zeroBits (bit . bitOpMsg) flagBit:: Int32
+    let biT = mkFlagBitWord flagBit
     putOpMsgHeader opMsgOpcode requestId -- header
     case cmd of
         Nc n -> case n of
@@ -562,24 +569,6 @@ putOpMsg cmd requestId flagBit params = do
                 putInt32 sec1Size
                 putCString "deletes"
                 putDocument doc
-            _ -> error "The KillCursors command cannot be wrapped into a Nc type constructor. Please use the Kc type constructor"
-        Req r -> case r of
-            QueryReq Query{..} -> do
-                let sec0 = foldl1' merge [qProjector, [ "$db" =: fDatabase qFullCollection ], qSelector]
-                putInt32 biT
-                putInt8 0
-                putDocument sec0
-            GetMore{..} -> do
-                let coll = fCollection gFullCollection
-                    db = fDatabase gFullCollection
-                    pre = ["getMore" =: gCursorId, "collection" =: coll, "$db" =: db, "batchSize" =: gBatchSize]
-                putInt32 (bit $ bitOpMsg $ ExhaustAllowed)
-                putInt8 0
-                putDocument pre
-            Message{..} -> do
-                putInt32 biT
-                putInt8 0
-                putDocument $ merge [ "$db" =: mDatabase ] mParams
         Kc KillC{..} -> do
             let coll = fCollection kFullCollection
             let db = fDatabase kFullCollection
@@ -610,6 +599,28 @@ putOpMsg cmd requestId flagBit params = do
                 i = runPut $ putCString identifier
                 sec1Size = lenBytes s + lenBytes i + 4
             in (sec0, sec1Size)
+
+putOpMsgRequest :: Request -> RequestId -> Maybe FlagBit -> Put
+putOpMsgRequest req requestId flagBit = do
+    let biT = mkFlagBitWord flagBit :: Int32
+    putOpMsgHeader opMsgOpcode requestId -- header
+    case req of
+        QueryReq Query{..} -> do
+            let sec0 = foldl1' merge [qProjector, [ "$db" =: fDatabase qFullCollection ], qSelector]
+            putInt32 biT
+            putInt8 0
+            putDocument sec0
+        GetMore{..} -> do
+            let coll = fCollection gFullCollection
+                db = fDatabase gFullCollection
+                pre = ["getMore" =: gCursorId, "collection" =: coll, "$db" =: db, "batchSize" =: gBatchSize]
+            putInt32 (bit $ bitOpMsg $ ExhaustAllowed)
+            putInt8 0
+            putDocument pre
+        Message{..} -> do
+            putInt32 biT
+            putInt8 0
+            putDocument $ merge [ "$db" =: mDatabase ] mParams
 
 iBit :: InsertOption -> Int32
 iBit KeepGoing = bit 0
@@ -782,7 +793,7 @@ rFlagsOpMsg bits = isValidFlag bits
   where isValidFlag bt =
           let setBits = map fst $ filter (\(_,b) -> b == True) $ zip ([0..31] :: [Int32]) $ map (testBit bt) [0 .. 31]
           in if any (\n -> not $ elem n [0,1,16]) setBits
-               then error "Unsopported bit was set"
+               then error "Unsupported bit was set"
                else filter (testBit bt . bitOpMsg) [ChecksumPresent ..]
 
 rBit :: ResponseFlag -> Int

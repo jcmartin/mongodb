@@ -1,6 +1,7 @@
 -- | Query and update documents
 
 {-# LANGUAGE OverloadedStrings, RecordWildCards, NamedFieldPuns, TupleSections, FlexibleContexts, FlexibleInstances, UndecidableInstances, MultiParamTypeClasses, TypeFamilies, CPP, DeriveDataTypeable, ScopedTypeVariables, BangPatterns #-}
+{-# LANGUAGE DataKinds #-}
 
 module Database.MongoDB.Query (
     -- * Monad
@@ -467,7 +468,7 @@ data WriteMode =
     | Confirm GetLastError  -- ^ Receive an acknowledgment after every write, and raise exception if one says the write failed. This is acomplished by sending the getLastError command, with given 'GetLastError' parameters, after every write.
     deriving (Show, Eq)
 
-write :: Notice -> Action IO (Maybe Document)
+write :: Notice k -> Action IO (Maybe Document)
 -- ^ Send write to server, and if write-mode is 'Safe' then include getLastError request and raise 'WriteFailure' if it reports an error.
 write notice = asks mongoWriteMode >>= \mode -> case mode of
     NoConfirm -> do
@@ -738,7 +739,7 @@ update opts (Select sel col) up = do
         liftIOE ConnectionFailure $
           P.sendOpMsg
             pipe
-            [Nc (Update (FullCollection db col) opts sel up)]
+            (pure (Nc (Update (FullCollection db col) opts sel up)))
             (Just P.MoreToCome)
             ["writeConcern" =: ["w" =: (0 :: Int32)]]
 
@@ -1026,7 +1027,7 @@ deleteOne sel@((Select sel' col)) = do
         liftIOE ConnectionFailure $
           P.sendOpMsg
             pipe
-            [Nc (Delete (FullCollection db col) [] sel')]
+            (pure (Nc (Delete (FullCollection db col) [] sel')))
             (Just P.MoreToCome)
             ["writeConcern" =: ["w" =: (0 :: Int32)]]
 
@@ -1546,10 +1547,10 @@ type DelayedBatch = IO Batch
 data Batch = Batch (Maybe Limit) CursorId [Document]
 -- ^ CursorId = 0 means cursor is finished. Documents is remaining documents to serve in current batch. Limit is number of documents to return. Nothing means no limit.
 
-requestQuery :: Pipe -> [Notice] -> (P.Query,Maybe Limit) -> IO DelayedBatch
+requestQuery :: Pipe -> [Notice k] -> (P.Query,Maybe Limit) -> IO DelayedBatch
 requestQuery pipe ns (q,limit') = request pipe ns (P.QueryReq q,limit')
 
-request :: Pipe -> [Notice] -> (Request, Maybe Limit) -> IO DelayedBatch
+request :: Pipe -> [Notice k] -> (Request, Maybe Limit) -> IO DelayedBatch
 -- ^ Send notices and request and return promised batch
 request pipe ns (req, remainingLimit) = do
     promise <- liftIOE ConnectionFailure $ P.call pipe ns req
@@ -1679,7 +1680,7 @@ next (Cursor fcol batchSize var) = liftDB $ modifyMVar var nextState where
                       let sd = P.serverData pipe
                       if maxWireVersion sd < 17
                         then liftIOE ConnectionFailure $ P.send pipe [KillCursors [cid]]
-                        else liftIOE ConnectionFailure $ P.sendOpMsg pipe [Kc (P.KillC [cid] fcol)] (Just MoreToCome) []
+                        else liftIOE ConnectionFailure $ P.sendOpMsg pipe (pure (Kc (P.KillC [cid] fcol))) (Just MoreToCome) []
                     return (dBatch', Just doc)
                 [] -> if cid == 0
                     then return (return $ Batch (Just 0) 0 [], Nothing)  -- finished

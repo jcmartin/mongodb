@@ -117,6 +117,7 @@ import Database.MongoDB.Internal.Protocol
     Pipe,
     QueryOption (..),
     Reply (..),
+    ReplyOpMsg(..),
     Request
       ( GetMore
       ),
@@ -1565,7 +1566,7 @@ requestOpMsg :: Pipe -> (P.Request, Maybe Limit) -> Document -> IO DelayedBatch
 requestOpMsg pipe (r, remainingLimit) params = do
   promise <- liftIOE ConnectionFailure $ P.callOpMsg pipe r Nothing params
   let protectedPromise = liftIOE ConnectionFailure promise
-  return $ fromReply remainingLimit =<< protectedPromise
+  return $ fromReplyOpMsg remainingLimit =<< protectedPromise
 
 fromReply :: Maybe Limit -> Reply -> DelayedBatch
 -- ^ Convert Reply to Batch or Failure
@@ -1587,7 +1588,10 @@ fromReply limit Reply{..} = do
                         Nothing  -> "$err is missing in documents."
                         Just err -> err
             in throwIO $ QueryFailure code errString
-fromReply limit ReplyOpMsg{..} = case sections of
+fromReply limit (ReplyOpMsg' r) = fromReplyOpMsg limit r
+
+fromReplyOpMsg :: Monad m => Maybe Limit -> ReplyOpMsg -> m Batch
+fromReplyOpMsg limit ReplyOpMsg{..} = case sections of
     [] -> return (Batch limit 0 sections)
     (section:_) -> case maybe Nothing cast $ look "cursor" section of
         Nothing -> return (Batch limit 0 sections)

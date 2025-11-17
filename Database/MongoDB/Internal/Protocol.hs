@@ -29,7 +29,7 @@ module Database.MongoDB.Internal.Protocol (
     Request(..), QueryOption(..), Cmd (..), KillC(..),
     Query(..),
     -- ** Reply
-    Reply(..), ResponseFlag(..), FlagBit(..),
+    Reply(..), ResponseFlag(..), FlagBit(..), ReplyOpMsg(..),
     -- * Authentication
     Username, Password, Nonce, pwHash, pwKey,
     isClosed, close, ServerData(..), Pipeline(..), putOpMsg,
@@ -259,7 +259,7 @@ call pipe notices request = do
     check requestId (responseTo, reply) = if requestId == responseTo then reply else
         error $ "expected response id (" ++ show responseTo ++ ") to match request id (" ++ show requestId ++ ")"
 
-callOpMsg :: Pipe -> Request -> Maybe FlagBit -> Document -> IO (IO Reply)
+callOpMsg :: Pipe -> Request -> Maybe FlagBit -> Document -> IO (IO ReplyOpMsg)
 -- ^ Send requests as a contiguous batch to server and return reply promise, which will block when invoked until reply arrives. This call and resulting promise will throw IOError if connection fails.
 callOpMsg pipe request flagBit params = do
     requestId <- genRequestId
@@ -274,24 +274,22 @@ callOpMsg pipe request flagBit params = do
    -- headers will reference the cursorId that was set in the previous message.
    -- see:
    -- https://github.com/mongodb/specifications/blob/master/source/message/OP_MSG.rst#moretocome-on-responses
-    checkFlagBit (_, r) =
+    checkFlagBit (_, ReplyOpMsg{..}) = flagBits == [MoreToCome]
+    produce reqId (rt,r) = runConduit $
       case r of
-        ReplyOpMsg{..} -> flagBits == [MoreToCome]
-         -- This is called by functions using the OP_MSG protocol,
-         -- so this has to be ReplyOpMsg
-        _ -> error "checkFlagBit: Impossible"
-    produce reqId p@(rt,r) = runConduit $
-      case r of
-          ReplyOpMsg{..} ->
+          ReplyOpMsg' r'@ReplyOpMsg{..} ->
             if flagBits == [MoreToCome]
-              then yieldResponses .| foldlC mergeResponses p
-              else return $ (rt, check reqId p)
-          _ -> error "produce: Impossible" -- see comment above
+              then yieldResponses .| foldlC mergeResponses (rt,r')
+              else return $ (rt, check reqId (rt,r'))
+          m -> error $ "produce: Expected ReplyOpMsg to OpMsg. Given: " <> show m
     yieldResponses = repeatWhileMC
           (do
              var <- newEmptyMVar
              liftIO $ atomically $ writeTChan (responseQueue pipe) var
-             readMVar var >>= either throwIO return :: IO Response
+             (r,resp) <- readMVar var >>= either throwIO return
+             case resp of
+                ReplyOpMsg' resp' -> return (r,resp')
+                m -> error $ "Expected ReplyOpMsg to OpMsg. Given: " <> show m
           )
           checkFlagBit
     mergeResponses p@(rt,rep) (_,r') = case (rep, r') of
@@ -312,7 +310,6 @@ callOpMsg pipe request flagBit params = do
                     (_,Nothing) -> error "mergeResponses: Nothing as second Impossible"
                     (Nothing,_) -> p
             _ -> error "mergeResponses: no sections in response"
-        _ -> error "mergeResponses: not ReplyOpMsg Impossible" -- see comment above
     check requestId (responseTo, reply) = if requestId == responseTo then reply else
         error $ "expected response id (" ++ show responseTo ++ ") to match request id (" ++ show requestId ++ ")"
     checkCursorId a b = if a == b then id else error $ "expected cursor ids (" ++ show a <> " " <> show b ++ ")"
@@ -743,12 +740,15 @@ data Reply = Reply {
     rStartingFrom :: Int32,
     rDocuments :: [Document]
     }
-   | ReplyOpMsg {
-        flagBits :: [FlagBit],
-        sections :: [Document],
-        checksum :: Maybe Int32
-    }
+   | ReplyOpMsg' ReplyOpMsg
     deriving (Show, Eq)
+
+data ReplyOpMsg = ReplyOpMsg
+    { flagBits :: [FlagBit]
+    , sections :: [Document]
+    , checksum :: Maybe Int32
+    }
+    deriving (Show,Eq)
 
 data ResponseFlag =
       CursorNotFound  -- ^ Set when getMore is called but the cursor id is not valid at the server. Returned with zero results.
@@ -774,7 +774,7 @@ getReply = do
             sec0 <- getDocument
             let sections = [sec0]
                 checksum = Nothing
-            return (responseTo, ReplyOpMsg{..})
+            return (responseTo, ReplyOpMsg' ReplyOpMsg{..})
       else do
           unless (opcode == replyOpcode) $ fail $ "expected reply opcode (1) but got " ++ show opcode
           rResponseFlags <-  rFlags <$> getInt32

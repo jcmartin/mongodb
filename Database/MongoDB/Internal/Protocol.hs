@@ -39,7 +39,7 @@ module Database.MongoDB.Internal.Protocol (
 #if !MIN_VERSION_base(4,8,0)
 import Control.Applicative ((<$>))
 #endif
-import Control.Monad ( forM, replicateM, unless, forever )
+import Control.Monad ( forM, replicateM, unless, forever, when )
 import Data.Binary.Get (Get, runGet, getInt8)
 import Data.Binary.Put (Put, runPut, putInt8)
 import Data.Bits (bit, testBit, zeroBits)
@@ -79,7 +79,7 @@ import qualified Database.MongoDB.Transport as Tr
 import Control.Concurrent.MVar.Lifted (MVar, newEmptyMVar, newMVar, withMVar,
                                        putMVar, readMVar, mkWeakMVar, isEmptyMVar)
 import GHC.List (foldl1')
-import Conduit (repeatWhileMC, (.|), runConduit, foldlC)
+import Conduit ((.|), runConduit, foldlC,ConduitT,yield,lift)
 #else
 import Control.Concurrent.MVar.Lifted (MVar, newEmptyMVar, newMVar, withMVar,
                                          putMVar, readMVar, addMVarFinalizer)
@@ -282,7 +282,7 @@ callOpMsg pipe request flagBit params = do
               then yieldResponses .| foldlC mergeResponses (rt,r')
               else return $ (rt, check reqId (rt,r'))
           m -> error $ "produce: Expected ReplyOpMsg to OpMsg. Given: " <> show m
-    yieldResponses = repeatWhileMC
+    yieldResponses = repeatWhileMCwithEnd
           (do
              var <- newEmptyMVar
              liftIO $ atomically $ writeTChan (responseQueue pipe) var
@@ -292,27 +292,29 @@ callOpMsg pipe request flagBit params = do
                 m -> error $ "Expected ReplyOpMsg to OpMsg. Given: " <> show m
           )
           checkFlagBit
-    mergeResponses p@(rt,rep) (_,r') = case (rep, r') of
+    mergeResponses (rt,rep) (_,r') = case (rep, r') of
         (ReplyOpMsg _ sec _, ReplyOpMsg _ sec' _) -> case (sec,sec') of
             (section:_,section':_) ->
                 let (cur, cur') = (maybe Nothing cast $ look "cursor" section,
                                   maybe Nothing cast $ look "cursor" section')
                 in case (cur, cur') of
-                    (Just doc, Just doc') -> do
+                    (Just doc, Just doc') ->
                         let (docs, docs') =
                               ( fromJust $ cast $ valueAt "nextBatch" doc :: [Document]
                               , fromJust $ cast $ valueAt "nextBatch" doc' :: [Document])
-                            id' = fromJust $ cast $ valueAt "id" doc :: CursorId
                             id'' = fromJust $ cast $ valueAt "id" doc' :: CursorId
-                        checkCursorId id' id'' (rt, rep{ sections = docs' ++ docs })
-                        -- Since we use this to process moreToCome messages, we
-                        -- know that there will be a nextBatch key in the document
-                    (_,Nothing) -> error "mergeResponses: Nothing as second Impossible"
-                    (Nothing,_) -> p
+                        in (rt, r'{ sections = [["cursor" =: ["id" =: id'',"nextBatch" =: docs <> docs']]] })
+                    _ -> error "mergeResponses: Nothing as second Impossible"
             _ -> error "mergeResponses: no sections in response"
     check requestId (responseTo, reply) = if requestId == responseTo then reply else
         error $ "expected response id (" ++ show responseTo ++ ") to match request id (" ++ show requestId ++ ")"
-    checkCursorId a b = if a == b then id else error $ "expected cursor ids (" ++ show a <> " " <> show b ++ ")"
+
+repeatWhileMCwithEnd :: Monad m => m a -> (a -> Bool) -> ConduitT i a m ()
+repeatWhileMCwithEnd m f = loop
+    where loop = do
+            x <- lift m
+            yield x
+            when (f x) loop
 
 -- * Message
 

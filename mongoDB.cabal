@@ -31,7 +31,7 @@ Library
   Build-depends:      array -any
                     , base >=4.13 && <5
                     , binary -any
-                    , bson >= 0.3 && < 0.5
+                    , bson >= 0.3 && < 1.2
                     , text
                     , bytestring -any
                     , containers -any

@@ -4,6 +4,11 @@ This project adheres to [Package Versioning Policy](https://wiki.haskell.org/Pac
 
 * Get rid of `MonadFail` constraints in `Database.MongoDB.Query`
 
+## [2.7.2.2] - 2026-03-18
+
+### Fixed
+- Support for authentication in version 8.2
+
 ## [2.7.1.4] - 2024-02-18
 
 ### Fixed

@@ -60,6 +60,7 @@ import Control.Monad
     void,
     when,
   )
+import Control.Monad((>=>))
 import Control.Monad.Reader (MonadReader, ReaderT, ask, asks, local, runReaderT)
 import Control.Monad.Trans (MonadIO, liftIO, lift)
 import Control.Monad.Trans.Except
@@ -267,14 +268,22 @@ useDb db = local (\ctx -> ctx {mongoDatabase = db})
 auth :: MonadIO m => Username -> Password -> Action m Bool
 -- ^ Authenticate with the current database (if server is running in secure mode). Return whether authentication was successful or not. Reauthentication is required for every new pipe. SCRAM-SHA-1 will be used for server versions 3.0+, MONGO-CR for lower versions.
 auth un pw = do
-    let serverVersion = fmap (at "version") $ useDb "admin" $ runCommand ["buildinfo" =: (1 :: Int)]
-    mmv <- takeMajorVersion <$> serverVersion
-    maybe (return False) performAuth mmv
+    mmv <- serverMajorVersion
+    case mmv of
+        Nothing   -> performAuth 8
+        Just mmv' -> performAuth mmv'
     where
     performAuth majorVersion
         | majorVersion >= (4 :: Int) = authSCRAMSHA256 un pw
         | majorVersion >= 3 = authSCRAMSHA1 un pw
         | otherwise = authMongoCR un pw
+
+-- | Note: Starting with mongo version 8.2 buildinfo requires authentication and therefore this function will always fail.
+--
+-- If it turns out a new authentication is needed, the command 'hello' and the wire version should be used instead. We
+-- cannot use this in general as it was not introduced into the wire protocol until version mongoDB 5.0.
+serverMajorVersion :: MonadIO m => Action m (Maybe Int)
+serverMajorVersion = fmap (lookup "version" >=> takeMajorVersion) $ useDb "admin" $ runCommand ["buildinfo" =: (1 :: Int)]
 
 takeMajorVersion :: Text -> Maybe Int
 takeMajorVersion t = case T.splitOn "." t of

@@ -4,6 +4,9 @@ This project adheres to [Package Versioning Policy](https://wiki.haskell.org/Pac
 
 * Get rid of `MonadFail` constraints in `Database.MongoDB.Query`
 
+## [2.7.2.3] - 2026-03-18
+* If shuffle is called with the empty list, just return the empty list.
+
 ## [2.7.2.2] - 2026-03-18
 
 ### Fixed

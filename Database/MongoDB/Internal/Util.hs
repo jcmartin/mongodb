@@ -54,8 +54,9 @@ wrap x = [x]
 
 shuffle :: [a] -> IO [a]
 -- ^ Randomly shuffle items in list
-shuffle [] = return []
-shuffle list = shuffle' list (length list) <$> newStdGen
+shuffle []    = return []
+shuffle a@[_] = return a
+shuffle list  = shuffle' list (length list) <$> newStdGen
 
 loop :: Monad m => m (Maybe a) -> m [a]
 -- ^ Repeatedy execute action, collecting results, until it returns Nothing
